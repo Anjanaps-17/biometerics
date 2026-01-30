@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for
+from flask import Flask, render_template, request, redirect, url_for, jsonify
 import sqlite3
 import hashlib
 
@@ -15,7 +15,6 @@ def hash_password(password):
 def init_db():
     conn = get_db()
     cursor = conn.cursor()
-    # Create table if it does not exist (with email column)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,17 +23,48 @@ def init_db():
             password TEXT
         )
     """)
-    # Try to add email column if table already existed without it
+    # If table existed without email column, try to add it
     try:
         cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
     except sqlite3.OperationalError:
-        # Column already exists or table just created – ignore
         pass
 
     conn.commit()
     conn.close()
 
-# ---------- ROUTES ----------
+# ---------- API ROUTES (for keystrokes) ----------
+
+@app.route("/api/enroll", methods=["POST"])
+def api_enroll():
+    data = request.get_json()
+    print("Enroll data received:", data)
+
+    if data is None:
+        return jsonify({"status": "error", "message": "No JSON received"}), 400
+    if "username" not in data or "events" not in data:
+        return jsonify({"status": "error", "message": "Invalid format"}), 400
+
+    return jsonify({
+        "status": "ok",
+        "received": True,
+        "event_count": len(data["events"])
+    })
+
+@app.route("/api/login-try", methods=["POST"])
+def api_login_try():
+    data = request.get_json()
+    print("Login keystroke data received:", data)
+
+    if data is None:
+        return jsonify({"status": "error", "message": "No JSON received"}), 400
+
+    # Later: compare with stored profile and return match result
+    return jsonify({
+        "status": "ok",
+        "received": True
+    })
+
+# ---------- ROUTES (HTML pages) ----------
 
 @app.route("/", methods=["GET", "POST"])
 def login():
@@ -57,7 +87,7 @@ def login():
         else:
             stored_hashed = row[0]
             if stored_hashed == hash_password(password):
-                return f"<h3>Logged in as {username}!</h3><br><a href='/'>Back</a>"
+                return redirect(url_for("home", username=username))
             else:
                 error = "Invalid username or password. Please try again or register first."
 
@@ -90,9 +120,40 @@ def register():
 
     return render_template("register.html", error=error, message=message)
 
+@app.route("/home")
+def home():
+    username = request.args.get("username")
+    return render_template("home.html", username=username)
+
+@app.route("/enroll", methods=["GET", "POST"])
+def enroll():
+    message = None
+    error = None
+
+    if request.method == "POST":
+        password = request.form["password"]
+        if password:
+            message = "Password sample received. Keystroke timings will be processed in the backend."
+        else:
+            error = "Please type the password before submitting."
+
+    return render_template("enroll.html", message=message, error=error)
+
+# ---------- Keystroke helper (future use) ----------
+
+def extract_timings(events):
+    dwell_times = []
+    flight_times = []
+    return {
+        "dwell": dwell_times,
+        "flight": flight_times
+    }
+
 # ---------- MAIN ----------
 
 if __name__ == "__main__":
     init_db()
     app.run(debug=True)
+
+
 

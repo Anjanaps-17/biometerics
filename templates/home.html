@@ -1,0 +1,175 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Online Banking Portal</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background: #f3f4f6;
+        color: #111827;
+      }
+      .navbar {
+        background: #111827;
+        color: #f9fafb;
+        padding: 12px 24px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .navbar-title {
+        font-size: 18px;
+        font-weight: bold;
+      }
+      .navbar-user a {
+        color: #f97373;
+        text-decoration: none;
+        margin-left: 10px;
+      }
+
+      .container {
+        max-width: 1000px;
+        margin: 30px auto;
+        padding: 0 20px;
+      }
+
+      .welcome {
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        margin-bottom: 20px;
+      }
+      .welcome h2 {
+        margin-top: 0;
+      }
+      .welcome p {
+        font-size: 14px;
+        line-height: 1.5;
+      }
+
+      .summary {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 16px;
+        margin-bottom: 24px;
+      }
+      .summary-card {
+        background: #111827;
+        color: #f9fafb;
+        padding: 16px;
+        border-radius: 8px;
+      }
+      .summary-card h3 {
+        margin: 0 0 6px;
+        font-size: 14px;
+        font-weight: normal;
+        color: #9ca3af;
+      }
+      .summary-card .amount {
+        font-size: 20px;
+        font-weight: bold;
+      }
+
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 16px;
+      }
+      .card {
+        background: white;
+        padding: 16px;
+        border-radius: 8px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+      }
+      .card h3 {
+        margin-top: 0;
+        margin-bottom: 8px;
+        font-size: 16px;
+      }
+      .card p {
+        font-size: 14px;
+        margin: 0 0 8px;
+      }
+      .btn {
+        display: inline-block;
+        padding: 6px 12px;
+        border-radius: 6px;
+        background: #2563eb;
+        color: white;
+        font-size: 13px;
+        text-decoration: none;
+      }
+      .btn:hover {
+        background: #1d4ed8;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="navbar">
+      <div class="navbar-title">Secure Online Banking</div>
+      <div class="navbar-user">
+        Logged in as <strong>{{ username }}</strong>
+        <a href="{{ url_for('login') }}">Logout</a>
+      </div>
+    </div>
+
+    <div class="container">
+      <div class="welcome">
+        <h2>Welcome, {{ username }}</h2>
+        <p>
+          This is a demo online banking portal. In this mini project, the login to this portal
+          is protected not only by a password, but also by a behavioral biometric layer
+          (keystroke dynamics) implemented in the backend.
+        </p>
+      </div>
+
+      <div class="summary">
+        <div class="summary-card">
+          <h3>Primary Account Balance</h3>
+          <div class="amount">₹ 1,23,456.78</div>
+        </div>
+        <div class="summary-card">
+          <h3>Last Login</h3>
+          <div class="amount">Today, 09:20 PM</div>
+        </div>
+        <div class="summary-card">
+          <h3>Security Status</h3>
+          <div class="amount">Behavioral check: Active</div>
+        </div>
+      </div>
+
+      <div class="cards">
+        <div class="card">
+          <h3>Account Summary</h3>
+          <p>View overview of your savings, current, and fixed deposit accounts.</p>
+          <a class="btn" href="#">View accounts</a>
+        </div>
+
+        <div class="card">
+          <h3>Recent Transactions</h3>
+          <p>Check your last transactions, debits, and credits for this account.</p>
+          <a class="btn" href="#">View transactions</a>
+        </div>
+
+        <div class="card">
+          <h3>Payments & Transfers</h3>
+          <p>Initiate fund transfers and bill payments (demo only, no real money).</p>
+          <a class="btn" href="#">Make a payment</a>
+        </div>
+
+        <div class="card">
+          <h3>Security Center (Project)</h3>
+          <p>
+            For project demonstration: explains how keystroke dynamics is used as an
+            additional authentication factor for this banking portal.
+          </p>
+          <!-- Later link this to your enroll/keystroke info page -->
+      <a class="btn" href="{{ url_for('enroll') }}">Open security center</a>
+
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
+

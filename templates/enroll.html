@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Keystroke Enrollment</title>
+    <style>
+      body {
+        background: #0f172a;
+        color: #e5e7eb;
+        font-family: Arial, sans-serif;
+        text-align: center;
+        padding: 50px;
+      }
+      form {
+        background: rgba(15, 23, 42, 0.9);
+        padding: 30px;
+        border-radius: 10px;
+        display: inline-block;
+        min-width: 320px;
+      }
+      input {
+        padding: 10px;
+        margin: 8px 0;
+        border-radius: 5px;
+        border: none;
+        width: 100%;
+      }
+      input[type=submit] {
+        background: #3b82f6;
+        color: white;
+        cursor: pointer;
+      }
+      p.note {
+        font-size: 13px;
+        color: #9ca3af;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>Keystroke Enrollment</h2>
+
+    <p class="note">
+      Please type the same password exactly as during registration. 
+      Type it <strong>3 times</strong> so we can capture your typing pattern.
+    </p>
+
+    {% if message %}
+      <p style="color:#22c55e;">{{ message }}</p>
+    {% endif %}
+    {% if error %}
+      <p style="color:#f97373;">{{ error }}</p>
+    {% endif %}
+
+    <form method="post">
+      <!-- Clear id on password field for JS -->
+      <input type="password" name="password" id="enroll-password" placeholder="Enter password">
+      <input type="submit" value="Submit sample">
+    </form>
+
+    <!-- External JS for keystroke capture during enrollment -->
+    <script src="{{ url_for('static', filename='js/enroll.js') }}"></script>
+  </body>
+</html>
