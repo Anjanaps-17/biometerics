@@ -1,248 +1,192 @@
 // enroll.js - Captures keystroke dynamics during enrollment
 console.log("enroll.js loaded");
 
-(function() {
+(function () {
     const passwordField = document.getElementById('enroll-password');
     if (!passwordField) {
         console.error("Enrollment password field not found!");
         return;
     }
 
-    // Track enrollment samples
     let enrollmentSamples = [];
-    let currentSample = {
-        events: [],
-        keyDownTimes: {}
-    };
-    let sampleCount = 0;
+    let sampleCount       = 0;
     const REQUIRED_SAMPLES = 3;
 
-    // Display status to user
+    // Per-sample state
+    let currentEvents   = [];
+    let currentKeyTimes = {}; // key → [] FIFO queue
+
+    // ── Status display ───────────────────────────────────────────────
     function updateStatus(message, isError = false) {
-        let statusDiv = document.getElementById('enroll-status');
-        if (!statusDiv) {
-            statusDiv = document.createElement('div');
-            statusDiv.id = 'enroll-status';
-            statusDiv.style.cssText = `
-                margin: 15px auto;
-                padding: 12px;
-                border-radius: 5px;
-                max-width: 400px;
-                font-size: 14px;
-                font-weight: bold;
-            `;
-            passwordField.parentElement.insertBefore(statusDiv, passwordField.nextSibling);
+        let el = document.getElementById('enroll-status');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'enroll-status';
+            el.style.cssText = [
+                'margin:15px auto', 'padding:12px', 'border-radius:5px',
+                'max-width:400px', 'font-size:14px', 'font-weight:bold'
+            ].join(';');
+            passwordField.parentElement.insertBefore(el, passwordField.nextSibling);
         }
-        
-        statusDiv.textContent = message;
-        statusDiv.style.background = isError ? 'rgba(239, 68, 68, 0.2)' : 'rgba(34, 197, 94, 0.2)';
-        statusDiv.style.color = isError ? '#f87171' : '#22c55e';
+        el.textContent = message;
+        el.style.background = isError ? 'rgba(239,68,68,0.2)'  : 'rgba(34,197,94,0.2)';
+        el.style.color      = isError ? '#f87171'               : '#22c55e';
     }
 
-    updateStatus(`Sample ${sampleCount + 1} of ${REQUIRED_SAMPLES} - Start typing your password`);
+    updateStatus(`Sample 1 of ${REQUIRED_SAMPLES} — type your password`);
 
-    // Capture keydown event
-    passwordField.addEventListener('keydown', function(e) {
+    // ── Keystroke capture ────────────────────────────────────────────
+    passwordField.addEventListener('keydown', function (e) {
         const key = e.key;
-        
-        // Ignore special keys
-        if (key.length > 1 && key !== 'Backspace' && key !== 'Enter') {
-            return;
-        }
+        if (key.length > 1 && key !== 'Backspace' && key !== 'Enter') return;
 
-        // Record keydown time
-        if (!currentSample.keyDownTimes[key]) {
-            currentSample.keyDownTimes[key] = e.timeStamp;
-            
-            currentSample.events.push({
-                key: key,
-                type: 'keydown',
-                timestamp: e.timeStamp
-            });
-        }
+        // FIX: FIFO queue per key — handles repeated letters safely
+        if (!currentKeyTimes[key]) currentKeyTimes[key] = [];
+        currentKeyTimes[key].push(e.timeStamp);
+
+        currentEvents.push({ key, type: 'keydown', timestamp: e.timeStamp });
     });
 
-    // Capture keyup event
-    passwordField.addEventListener('keyup', function(e) {
+    passwordField.addEventListener('keyup', function (e) {
         const key = e.key;
-        
-        // Ignore special keys
-        if (key.length > 1 && key !== 'Backspace' && key !== 'Enter') {
-            return;
-        }
+        if (key.length > 1 && key !== 'Backspace' && key !== 'Enter') return;
 
         const keyUpTime = e.timeStamp;
-        const keyDownTime = currentSample.keyDownTimes[key];
+        const queue = currentKeyTimes[key];
 
-        if (keyDownTime) {
-            const dwellTime = keyUpTime - keyDownTime;
-            
-            currentSample.events.push({
-                key: key,
+        if (queue && queue.length > 0) {
+            // FIX: consume earliest keydown (FIFO)
+            const keyDownTime = queue.shift();
+            currentEvents.push({
+                key,
                 type: 'keyup',
                 timestamp: keyUpTime,
-                dwell_time: dwellTime
+                dwell_time: keyUpTime - keyDownTime
             });
-
-            // Clear the keydown time
-            delete currentSample.keyDownTimes[key];
         }
     });
 
-    // Intercept form submission
+    // Clear when field is emptied manually
+    passwordField.addEventListener('input', function () {
+        if (this.value === '') {
+            currentEvents   = [];
+            currentKeyTimes = {};
+        }
+    });
+
+    // ── Form submit ──────────────────────────────────────────────────
     const form = passwordField.closest('form');
-    if (form) {
-        form.addEventListener('submit', function(e) {
-            e.preventDefault();
-            
-            const password = passwordField.value;
-            
-            if (!password) {
-                updateStatus('Please type your password', true);
-                return;
-            }
+    if (!form) return;
 
-            if (currentSample.events.length === 0) {
-                updateStatus('No keystroke data captured. Please type again.', true);
-                return;
-            }
+    form.addEventListener('submit', function (e) {
+        e.preventDefault(); // always — JS handles everything
 
-            // Calculate timing features for this sample
-            const timingFeatures = extractTimingFeatures(currentSample.events);
-            
-            // Store this sample
-            enrollmentSamples.push({
-                password: password,
-                events: currentSample.events,
-                timings: timingFeatures,
-                sample_number: sampleCount + 1
-            });
+        const password = passwordField.value;
 
-            sampleCount++;
-            console.log(`Sample ${sampleCount} captured:`, timingFeatures);
+        if (!password) {
+            updateStatus('Please type your password first.', true);
+            return;
+        }
+        if (currentEvents.length === 0) {
+            updateStatus('No keystroke data captured. Please type again.', true);
+            return;
+        }
 
-            // Check if we have enough samples
-            if (sampleCount >= REQUIRED_SAMPLES) {
-                // Send all samples to server
-                sendEnrollmentData(enrollmentSamples);
-            } else {
-                // Clear for next sample
-                currentSample = {
-                    events: [],
-                    keyDownTimes: {}
-                };
-                passwordField.value = '';
-                updateStatus(`Sample ${sampleCount + 1} of ${REQUIRED_SAMPLES} - Type the same password again`);
-                passwordField.focus();
+        // FIX: build the sample in the exact shape the backend expects:
+        // { timings: { dwell_times: [...], flight_times: [...] } }
+        const timings = extractTimingFeatures(currentEvents);
+
+        enrollmentSamples.push({
+            timings: {
+                dwell_times:  timings.dwell_times,
+                flight_times: timings.flight_times
             }
         });
-    }
 
-    // Send enrollment data to backend
+        sampleCount++;
+        console.log(`Sample ${sampleCount} captured:`, timings);
+
+        // Tell the page to update the progress dots
+        document.dispatchEvent(new CustomEvent('enrollSampleCaptured', { detail: { count: sampleCount } }));
+
+        if (sampleCount >= REQUIRED_SAMPLES) {
+            sendEnrollmentData(enrollmentSamples);
+        } else {
+            // Reset for next sample
+            currentEvents   = [];
+            currentKeyTimes = {};
+            passwordField.value = '';
+            updateStatus(`Sample ${sampleCount + 1} of ${REQUIRED_SAMPLES} — type the same password again`);
+            passwordField.focus();
+        }
+    });
+
+    // ── Send to backend ──────────────────────────────────────────────
     function sendEnrollmentData(samples) {
-        updateStatus('Processing enrollment data...');
-        
-        // Get username from session/URL or prompt
-        const username = new URLSearchParams(window.location.search).get('username') 
-                        || prompt('Enter your username for enrollment:');
-        
+        updateStatus('Saving your keystroke profile…');
+
+        // FIX: get username from URL param only — no prompt() fallback needed
+        // because register always redirects to /enroll?username=...
+        const username = new URLSearchParams(window.location.search).get('username');
+
         if (!username) {
-            updateStatus('Username required for enrollment', true);
+            updateStatus('Username missing from URL. Please re-register.', true);
             return;
         }
 
         fetch('/api/enroll', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                username: username,
-                samples: samples,
-                sample_count: samples.length
-            })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, samples })
         })
-        .then(response => response.json())
+        .then(r => r.json())
         .then(data => {
             console.log("Enrollment response:", data);
-            
-            if (data.status === 'ok' || data.enrolled) {
-                updateStatus('✓ Enrollment successful! Your keystroke pattern has been saved.');
-                
-                // Redirect to home or login after 2 seconds
+            if (data.enrolled) {
+                updateStatus('✓ Enrollment complete! Redirecting to login…');
                 setTimeout(() => {
-                    window.location.href = '/home?username=' + encodeURIComponent(username);
+                    window.location.href = '/';   // send to login page
                 }, 2000);
             } else {
                 updateStatus(data.message || 'Enrollment failed. Please try again.', true);
-                // Reset enrollment
                 resetEnrollment();
             }
         })
-        .catch(error => {
-            console.error('Error sending enrollment data:', error);
-            updateStatus('Error during enrollment. Please try again.', true);
+        .catch(err => {
+            console.error('Enrollment error:', err);
+            updateStatus('Network error during enrollment. Please try again.', true);
             resetEnrollment();
         });
     }
 
-    // Reset enrollment process
     function resetEnrollment() {
         enrollmentSamples = [];
-        currentSample = {
-            events: [],
-            keyDownTimes: {}
-        };
-        sampleCount = 0;
+        currentEvents     = [];
+        currentKeyTimes   = {};
+        sampleCount       = 0;
         passwordField.value = '';
-        updateStatus(`Sample 1 of ${REQUIRED_SAMPLES} - Start typing your password`);
+        updateStatus(`Sample 1 of ${REQUIRED_SAMPLES} — type your password`);
     }
 
-    // Extract timing features
+    // ── Timing extractor ─────────────────────────────────────────────
     function extractTimingFeatures(events) {
-        const dwellTimes = [];
+        const dwellTimes  = [];
         const flightTimes = [];
-        
         let lastKeyUpTime = null;
 
-        for (let i = 0; i < events.length; i++) {
-            const event = events[i];
-            
-            // Dwell time
-            if (event.type === 'keyup' && event.dwell_time) {
+        for (const event of events) {
+            if (event.type === 'keyup' && event.dwell_time != null) {
                 dwellTimes.push(event.dwell_time);
             }
-            
-            // Flight time
-            if (event.type === 'keydown') {
-                if (lastKeyUpTime !== null) {
-                    const flightTime = event.timestamp - lastKeyUpTime;
-                    flightTimes.push(flightTime);
-                }
+            if (event.type === 'keydown' && lastKeyUpTime !== null) {
+                flightTimes.push(event.timestamp - lastKeyUpTime);
             }
-            
             if (event.type === 'keyup') {
                 lastKeyUpTime = event.timestamp;
             }
         }
 
-        return {
-            dwell_times: dwellTimes,
-            flight_times: flightTimes,
-            total_keys: dwellTimes.length,
-            avg_dwell: dwellTimes.length > 0 ? dwellTimes.reduce((a,b) => a+b, 0) / dwellTimes.length : 0,
-            avg_flight: flightTimes.length > 0 ? flightTimes.reduce((a,b) => a+b, 0) / flightTimes.length : 0
-        };
+        return { dwell_times: dwellTimes, flight_times: flightTimes };
     }
-
-    // Clear events when password field is cleared manually
-    passwordField.addEventListener('input', function() {
-        if (this.value === '') {
-            currentSample = {
-                events: [],
-                keyDownTimes: {}
-            };
-        }
-    });
 
 })();

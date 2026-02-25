@@ -10,37 +10,70 @@
         text-align: center;
         padding: 50px;
       }
+      h2 { color: #60a5fa; }
+      p.note {
+        font-size: 13px;
+        color: #9ca3af;
+        max-width: 400px;
+        margin: 0 auto 20px;
+      }
       form {
         background: rgba(15, 23, 42, 0.9);
         padding: 30px;
         border-radius: 10px;
         display: inline-block;
         min-width: 320px;
+        border: 1px solid rgba(255,255,255,0.1);
       }
-      input {
+      input[type=password] {
         padding: 10px;
         margin: 8px 0;
         border-radius: 5px;
-        border: none;
+        border: 1px solid #334155;
+        background: #1e293b;
+        color: #e5e7eb;
         width: 100%;
+        box-sizing: border-box;
+        font-size: 15px;
+      }
+      input[type=password]:focus {
+        outline: none;
+        border-color: #3b82f6;
       }
       input[type=submit] {
         background: #3b82f6;
         color: white;
         cursor: pointer;
+        padding: 10px;
+        border: none;
+        border-radius: 5px;
+        width: 100%;
+        margin-top: 8px;
+        font-size: 15px;
       }
-      p.note {
-        font-size: 13px;
-        color: #9ca3af;
+      input[type=submit]:hover { background: #2563eb; }
+
+      /* Progress dots */
+      #sample-dots {
+        display: flex;
+        justify-content: center;
+        gap: 12px;
+        margin: 10px 0 16px;
       }
+      .dot {
+        width: 16px; height: 16px;
+        border-radius: 50%;
+        background: #334155;
+        transition: background 0.4s;
+      }
+      .dot.filled { background: #22c55e; }
     </style>
   </head>
   <body>
     <h2>Keystroke Enrollment</h2>
-
     <p class="note">
-      Please type the same password exactly as during registration. 
-      Type it <strong>3 times</strong> so we can capture your typing pattern.
+      Type your password <strong>3 times</strong> so we can learn your unique typing pattern.
+      Use the exact same password you registered with.
     </p>
 
     {% if message %}
@@ -50,13 +83,44 @@
       <p style="color:#f97373;">{{ error }}</p>
     {% endif %}
 
-    <form method="post">
-      <!-- Clear id on password field for JS -->
-      <input type="password" name="password" id="enroll-password" placeholder="Enter password">
-      <input type="submit" value="Submit sample">
+    <!--
+      CRITICAL FIX: NO method="post" here.
+      The old version had method="post" which caused the browser to do a real
+      form POST to Flask at the same time as the JS fetch — wiping JS state
+      and never saving the keystroke profile to the database.
+      JS (enroll.js) handles everything via fetch('/api/enroll').
+    -->
+    <form id="enroll-form">
+      <div id="sample-dots">
+        <div class="dot" id="dot-1"></div>
+        <div class="dot" id="dot-2"></div>
+        <div class="dot" id="dot-3"></div>
+      </div>
+
+      <input
+        type="password"
+        name="password"
+        id="enroll-password"
+        placeholder="Type your password here"
+        autocomplete="off"
+        autofocus
+      >
+
+      <!-- enroll.js injects the status message div right after this input -->
+
+      <input type="submit" value="Submit Sample">
     </form>
 
-    <!-- External JS for keystroke capture during enrollment -->
     <script src="{{ url_for('static', filename='js/enroll.js') }}"></script>
+
+    <!-- Update progress dots when enroll.js captures each sample -->
+    <script>
+      document.addEventListener('enrollSampleCaptured', function (e) {
+        for (let i = 1; i <= e.detail.count; i++) {
+          const dot = document.getElementById('dot-' + i);
+          if (dot) dot.classList.add('filled');
+        }
+      });
+    </script>
   </body>
 </html>

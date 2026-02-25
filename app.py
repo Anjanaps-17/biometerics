@@ -1,111 +1,276 @@
 from flask import Flask, render_template, request, redirect, url_for, jsonify
 import sqlite3
 import hashlib
+import hmac
 import math
+import os
+from datetime import datetime, timedelta
 from statistics import mean, stdev
 
 app = Flask(__name__)
 
-# ---------- DB helpers ----------
+# ─────────────────────────────────────────────
+#  CONFIG
+# ─────────────────────────────────────────────
+MAX_FAILED_ATTEMPTS  = 3     # lockout after this many consecutive failures
+LOCKOUT_MINUTES      = 15    # auto-unlock after this many minutes
+Z_THRESHOLD          = 2.5   # fixed z-space threshold (distance already normalised)
+MIN_STD              = 0.0001  # division-by-zero guard
+DEBUG_MODE           = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+
+
+# ─────────────────────────────────────────────
+#  DB HELPERS
+# ─────────────────────────────────────────────
 
 def get_db():
     return sqlite3.connect("users.db")
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+
+def hash_password(password: str) -> tuple:
+    """
+    PBKDF2-HMAC-SHA256 with a random 32-byte salt.
+    Returns (hex_hash, hex_salt).
+    """
+    salt = os.urandom(32)
+    key  = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 260_000)
+    return key.hex(), salt.hex()
+
+
+def verify_password(password: str, stored_hash: str, stored_salt: str) -> bool:
+    """
+    Constant-time comparison via hmac.compare_digest to prevent timing attacks.
+    """
+    salt = bytes.fromhex(stored_salt)
+    key  = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 260_000)
+    return hmac.compare_digest(key.hex(), stored_hash)   # Fix 6: timing-safe
+
 
 def init_db():
-    conn = get_db()
+    print(">>> init_db() running <<<")
+    conn   = get_db()
     cursor = conn.cursor()
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE,
-            email TEXT,
-            password TEXT
+            email    TEXT,
+            password TEXT,
+            salt     TEXT
         )
     """)
-    # If table existed without email column, try to add it
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
-    except sqlite3.OperationalError:
-        pass
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS keystroke_profiles (
+            user_id     INTEGER PRIMARY KEY,
+            mean_dwell  REAL,
+            std_dwell   REAL,
+            mean_flight REAL,
+            std_flight  REAL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS failed_attempts (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            username  TEXT,
+            distance  REAL,
+            timestamp TEXT
+        )
+    """)
+
+    # Fix 5: added last_fail_time for time-based lockout reset
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS lockout (
+            username       TEXT PRIMARY KEY,
+            fail_count     INTEGER DEFAULT 0,
+            last_fail_time TEXT
+        )
+    """)
+
+    for col in ("email TEXT", "salt TEXT"):
+        try:
+            cursor.execute(f"ALTER TABLE users ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
 
     conn.commit()
     conn.close()
 
-# ---------- KEYSTROKE ANALYSIS FUNCTIONS ----------
 
-def calculate_profile_statistics(samples):
+# ─────────────────────────────────────────────
+#  KEYSTROKE ANALYSIS
+# ─────────────────────────────────────────────
+
+def calculate_profile_statistics(samples: list) -> dict:
     """
-    Calculate mean and standard deviation for keystroke timings
-    from multiple enrollment samples.
-    
-    Args:
-        samples: List of sample dictionaries, each containing 'timings' with dwell_times and flight_times
-    
-    Returns:
-        Dictionary with mean and std for dwell and flight times
+    Aggregate dwell & flight times from all enrollment samples,
+    compute mean and std for each dimension.
     """
-    all_dwell_times = []
-    all_flight_times = []
-    
-    # Collect all timing data from all samples
+    all_dwell  = []
+    all_flight = []
+
     for sample in samples:
-        timings = sample.get('timings', {})
-        dwell_times = timings.get('dwell_times', [])
-        flight_times = timings.get('flight_times', [])
-        
-        all_dwell_times.extend(dwell_times)
-        all_flight_times.extend(flight_times)
-    
-    # Calculate statistics
-    profile = {
-        'mean_dwell': mean(all_dwell_times) if all_dwell_times else 0,
-        'std_dwell': stdev(all_dwell_times) if len(all_dwell_times) > 1 else 0,
-        'mean_flight': mean(all_flight_times) if all_flight_times else 0,
-        'std_flight': stdev(all_flight_times) if len(all_flight_times) > 1 else 0,
-        'dwell_count': len(all_dwell_times),
-        'flight_count': len(all_flight_times)
+        timings = sample.get("timings", {})
+        all_dwell.extend(timings.get("dwell_times",  []))
+        all_flight.extend(timings.get("flight_times", []))
+
+    return {
+        "mean_dwell":   mean(all_dwell)   if all_dwell           else 0,
+        "std_dwell":    stdev(all_dwell)  if len(all_dwell)  > 1 else MIN_STD,
+        "mean_flight":  mean(all_flight)  if all_flight          else 0,
+        "std_flight":   stdev(all_flight) if len(all_flight) > 1 else MIN_STD,
+        "dwell_count":  len(all_dwell),
+        "flight_count": len(all_flight),
     }
-    
-    return profile
 
-def euclidean_distance(current_timings, stored_profile):
-    """
-    Calculate Euclidean distance between current keystroke timings 
-    and stored profile.
-    
-    Formula: distance = sqrt(sum((current - mean)^2))
-    
-    Args:
-        current_timings: Dict with 'dwell_times' and 'flight_times' arrays
-        stored_profile: Dict with mean and std values
-    
-    Returns:
-        Float: Euclidean distance (lower = more similar)
-    """
-    dwell_times = current_timings.get('dwell_times', [])
-    flight_times = current_timings.get('flight_times', [])
-    
-    mean_dwell = stored_profile.get('mean_dwell', 0)
-    mean_flight = stored_profile.get('mean_flight', 0)
-    
-    # Calculate squared differences
-    dwell_diff_squared = sum((t - mean_dwell) ** 2 for t in dwell_times)
-    flight_diff_squared = sum((t - mean_flight) ** 2 for t in flight_times)
-    
-    # Euclidean distance
-    distance = math.sqrt(dwell_diff_squared + flight_diff_squared)
-    
-    return distance
 
-# ---------- API ROUTES (for keystrokes) ----------
+def z_score_euclidean_distance(current_timings: dict, stored_profile: dict) -> float:
+    """
+    Z-score normalised Euclidean distance.
+
+    Every timing is converted to:  z = (t - mean) / std
+    Then:  distance = sqrt(sum_z²) / total_points
+
+    Result is in Z-space (dimensionless), compared against Z_THRESHOLD = 2.5.
+    This is mathematically consistent — no mixed scales.
+    """
+    dwell_times  = current_timings.get("dwell_times",  [])
+    flight_times = current_timings.get("flight_times", [])
+
+    mean_dwell  = stored_profile.get("mean_dwell",  0)
+    mean_flight = stored_profile.get("mean_flight", 0)
+    std_dwell   = max(stored_profile.get("std_dwell",  MIN_STD), MIN_STD)  # Fix 4 (div/0)
+    std_flight  = max(stored_profile.get("std_flight", MIN_STD), MIN_STD)
+
+    dwell_z_sq  = sum(((t - mean_dwell)  / std_dwell)  ** 2 for t in dwell_times)
+    flight_z_sq = sum(((t - mean_flight) / std_flight) ** 2 for t in flight_times)
+
+    total_points = len(dwell_times) + len(flight_times)
+
+    # Normalise by total points → independent of password length
+    return math.sqrt(dwell_z_sq + flight_z_sq) / max(total_points, 1)
+
+
+def extract_timings(events: list) -> dict:
+    """
+    Convert raw keydown/keyup event list → dwell_times & flight_times.
+
+    Fix 1: returns keys "dwell_times" and "flight_times" (consistent everywhere).
+    Fix 2: uses a list-per-key queue so repeated letters (e.g. "aa") don't
+           corrupt dwell calculations — earliest keydown is always consumed first.
+    """
+    dwell_times   = []
+    flight_times  = []
+    last_keyup    = None
+    keydown_times = {}          # key → list of timestamps (FIFO queue per key)
+
+    for event in events:
+        if event["type"] == "keydown":
+            # Fix 2: append to list instead of overwriting
+            keydown_times.setdefault(event["key"], []).append(event["timestamp"])
+
+            if last_keyup is not None:
+                flight_times.append(event["timestamp"] - last_keyup)
+
+        elif event["type"] == "keyup":
+            queue = keydown_times.get(event["key"])
+            if queue:
+                # Fix 2: pop the earliest keydown for this key (FIFO)
+                keydown_ts = queue.pop(0)
+                dwell_times.append(event["timestamp"] - keydown_ts)
+                last_keyup = event["timestamp"]
+
+    return {
+        "dwell_times":  dwell_times,   # Fix 1: consistent key name
+        "flight_times": flight_times,  # Fix 1: consistent key name
+    }
+
+
+# ─────────────────────────────────────────────
+#  LOCKOUT HELPERS  (with time-based auto-reset)
+# ─────────────────────────────────────────────
+
+def get_fail_info(cursor, username: str) -> tuple:
+    """Returns (fail_count, last_fail_time_str)."""
+    cursor.execute(
+        "SELECT fail_count, last_fail_time FROM lockout WHERE username = ?",
+        (username,)
+    )
+    row = cursor.fetchone()
+    return (row[0], row[1]) if row else (0, None)
+
+
+def is_locked_out(cursor, username: str) -> bool:
+    """
+    Fix 5: Time-based lockout — automatically clears after LOCKOUT_MINUTES.
+    """
+    fail_count, last_fail_str = get_fail_info(cursor, username)
+
+    if fail_count < MAX_FAILED_ATTEMPTS:
+        return False
+
+    if last_fail_str is None:
+        return False
+
+    last_fail = datetime.fromisoformat(last_fail_str)
+    if datetime.utcnow() - last_fail > timedelta(minutes=LOCKOUT_MINUTES):
+        # Lockout window expired — auto-reset
+        cursor.execute(
+            "UPDATE lockout SET fail_count = 0, last_fail_time = NULL WHERE username = ?",
+            (username,)
+        )
+        return False
+
+    return True
+
+
+def increment_fail(cursor, username: str, distance: float):
+    now = datetime.utcnow().isoformat()
+
+    cursor.execute(
+        "INSERT INTO failed_attempts (username, distance, timestamp) VALUES (?,?,?)",
+        (username, round(distance, 4), now)
+    )
+    cursor.execute("""
+        INSERT INTO lockout (username, fail_count, last_fail_time) VALUES (?, 1, ?)
+        ON CONFLICT(username) DO UPDATE SET
+            fail_count     = fail_count + 1,
+            last_fail_time = ?
+    """, (username, now, now))
+
+
+def reset_fail(cursor, username: str):
+    cursor.execute("""
+        INSERT INTO lockout (username, fail_count, last_fail_time) VALUES (?, 0, NULL)
+        ON CONFLICT(username) DO UPDATE SET
+            fail_count     = 0,
+            last_fail_time = NULL
+    """, (username,))
+
+
+# ─────────────────────────────────────────────
+#  API: ENROLL
+# ─────────────────────────────────────────────
 
 @app.route("/api/enroll", methods=["POST"])
 def api_enroll():
     """
-    Handle keystroke enrollment - receives 3 samples and calculates profile
+    Receive ≥3 typing samples, compute keystroke profile, save to DB.
+
+    Body JSON:
+    {
+      "username": "alice",
+      "samples": [
+        { "timings": { "dwell_times": [...], "flight_times": [...] } },
+        ...
+      ]
+    }
+
+    Security note: client-side timing data can be spoofed. In production,
+    integrity validation or session-bound capture would be required.
     """
     data = request.get_json()
     print("\n" + "="*60)
@@ -114,123 +279,250 @@ def api_enroll():
 
     if data is None:
         return jsonify({"status": "error", "message": "No JSON received"}), 400
-    
-    username = data.get('username')
-    samples = data.get('samples', [])
-    
+
+    username = data.get("username")
+    samples  = data.get("samples", [])
+
     if not username or not samples:
         return jsonify({"status": "error", "message": "Missing username or samples"}), 400
-    
+
     if len(samples) < 3:
         return jsonify({"status": "error", "message": "Need at least 3 samples"}), 400
-    
-    # Calculate profile statistics from all samples
+
+    conn   = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
+    if not user:
+        conn.close()
+        return jsonify({"status": "error", "message": "User not found"}), 404
+
+    user_id = user[0]
     profile = calculate_profile_statistics(samples)
-    
-    print(f"\n✓ Enrollment successful for user: {username}")
-    print(f"  Samples collected: {len(samples)}")
-    print(f"  Mean dwell time: {profile['mean_dwell']:.2f} ms")
-    print(f"  Std dwell time: {profile['std_dwell']:.2f} ms")
-    print(f"  Mean flight time: {profile['mean_flight']:.2f} ms")
-    print(f"  Std flight time: {profile['std_flight']:.2f} ms")
-    print(f"  Total dwell events: {profile['dwell_count']}")
-    print(f"  Total flight events: {profile['flight_count']}")
+
+    cursor.execute("""
+        INSERT INTO keystroke_profiles (user_id, mean_dwell, std_dwell, mean_flight, std_flight)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            mean_dwell  = excluded.mean_dwell,
+            std_dwell   = excluded.std_dwell,
+            mean_flight = excluded.mean_flight,
+            std_flight  = excluded.std_flight
+    """, (user_id,
+          profile["mean_dwell"],  profile["std_dwell"],
+          profile["mean_flight"], profile["std_flight"]))
+
+    conn.commit()
+    conn.close()
+
+    print(f"\n✓ Enrolled          : {username}")
+    print(f"  Samples           : {len(samples)}")
+    print(f"  mean_dwell        : {profile['mean_dwell']:.2f} ms  |  std: {profile['std_dwell']:.2f}")
+    print(f"  mean_flight       : {profile['mean_flight']:.2f} ms  |  std: {profile['std_flight']:.2f}")
+    print(f"  Z threshold       : {Z_THRESHOLD}  (fixed, distance is already in z-space)")
     print("="*60 + "\n")
-    
-    # Return success (your friend will save to database later)
+
     return jsonify({
-        "status": "ok",
+        "status":   "ok",
         "enrolled": True,
-        "message": "Keystroke profile created successfully",
+        "message":  "Keystroke profile saved successfully",
         "profile": {
-            "mean_dwell": profile['mean_dwell'],
-            "std_dwell": profile['std_dwell'],
-            "mean_flight": profile['mean_flight'],
-            "std_flight": profile['std_flight'],
-            "sample_count": len(samples)
+            "mean_dwell":   profile["mean_dwell"],
+            "std_dwell":    profile["std_dwell"],
+            "mean_flight":  profile["mean_flight"],
+            "std_flight":   profile["std_flight"],
+            "sample_count": len(samples),
+            "threshold":    Z_THRESHOLD,
         }
     })
+
+
+# ─────────────────────────────────────────────
+#  API: LOGIN
+# ─────────────────────────────────────────────
 
 @app.route("/api/login-try", methods=["POST"])
 def api_login_try():
     """
-    Handle login keystroke verification - validates password and keystroke timing
+    Full authentication pipeline:
+      1. Time-based lockout check (auto-resets after LOCKOUT_MINUTES)
+      2. PBKDF2 password verify  (constant-time comparison)
+      3. Load THIS user's keystroke profile from DB
+      4. Z-score normalised Euclidean distance  (password-length independent)
+      5. Compare against fixed Z_THRESHOLD = 2.5  (mathematically consistent)
+      6. Log failures / reset counter on success
+
+    Security note: client-side timing data can be spoofed. In production,
+    integrity validation or session-bound capture would be required.
+
+    Body JSON:
+    {
+      "username": "alice",
+      "password": "secret",
+      "timings": { "dwell_times": [...], "flight_times": [...], "total_keys": N }
+    }
     """
     data = request.get_json()
     print("\n" + "="*60)
-    print("LOGIN ATTEMPT - KEYSTROKE DATA RECEIVED")
+    print("LOGIN ATTEMPT")
     print("="*60)
 
     if data is None:
         return jsonify({"status": "error", "message": "No JSON received"}), 400
-    
-    username = data.get('username')
-    password = data.get('password')
-    timings = data.get('timings', {})
-    
+
+    username = data.get("username")
+    password = data.get("password")
+    timings  = data.get("timings", {})
+
     if not username or not password:
         return jsonify({"status": "error", "message": "Missing credentials"}), 400
-    
-    # Display captured keystroke data
-    print(f"\n👤 User: {username}")
-    print(f"📊 Keystroke Timings Captured:")
-    print(f"   Dwell times: {timings.get('dwell_times', [])}")
-    print(f"   Flight times: {timings.get('flight_times', [])}")
-    print(f"   Total keys: {timings.get('total_keys', 0)}")
-    
-    # Verify password first
-    conn = get_db()
+
+    conn   = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT password FROM users WHERE username = ?", (username,))
-    row = cursor.fetchone()
-    conn.close()
-    
-    if not row:
+
+    # ── 1. Time-based lockout check ─────────────────────────────────
+    if is_locked_out(cursor, username):
+        fail_count, last_fail_str = get_fail_info(cursor, username)
+        last_fail  = datetime.fromisoformat(last_fail_str)
+        unlock_at  = last_fail + timedelta(minutes=LOCKOUT_MINUTES)
+        mins_left  = max(0, int((unlock_at - datetime.utcnow()).total_seconds() / 60) + 1)
+        conn.commit()
+        conn.close()
+        print(f"🔒 Account locked: {username}  (unlocks in ~{mins_left} min)")
+        print("="*60 + "\n")
+        return jsonify({
+            "status": "error", "authenticated": False,
+            "message": f"Account locked. Try again in ~{mins_left} minute(s)."
+        }), 403
+
+    # ── 2. Password verification (PBKDF2 + constant-time compare) ───
+    cursor.execute("SELECT id, password, salt FROM users WHERE username = ?", (username,))
+    user_row = cursor.fetchone()
+
+    if not user_row:
+        conn.close()
         print("❌ User not found")
         print("="*60 + "\n")
-        return jsonify({
-            "status": "error",
-            "authenticated": False,
-            "message": "Invalid username or password"
-        }), 401
-    
-    stored_hashed = row[0]
-    if stored_hashed != hash_password(password):
-        print("❌ Password incorrect")
-        print("="*60 + "\n")
-        return jsonify({
-            "status": "error",
-            "authenticated": False,
-            "message": "Invalid username or password"
-        }), 401
-    
-    print("✓ Password verified")
-    
-    
-    if timings.get('dwell_times') and timings.get('flight_times'):
-        print("✓ Keystroke data validated")
-        print("\n Keystroke verification skipped")
-        print("   (Need to implement database comparison)")
-        print("="*60 + "\n")
-        
-        
-        return jsonify({
-            "status": "ok",
-            "authenticated": True,
-            "keystroke_verified": True,
-            "message": "Login successful (keystroke verification pending database implementation)"
-        })
+        return jsonify({"status": "error", "authenticated": False,
+                        "message": "Invalid username or password"}), 401
+
+    user_id, stored_hash, stored_salt = user_row
+
+    # Backward-compat: legacy SHA-256 accounts (no salt)
+    if stored_salt:
+        password_ok = verify_password(password, stored_hash, stored_salt)
     else:
+        legacy = hashlib.sha256(password.encode()).hexdigest()
+        password_ok = hmac.compare_digest(legacy, stored_hash)
+
+    if not password_ok:
+        conn.close()
+        print("❌ Wrong password")
+        print("="*60 + "\n")
+        return jsonify({"status": "error", "authenticated": False,
+                        "message": "Invalid username or password"}), 401
+
+    print("✓ Password verified")
+
+    # ── 3. Load this user's keystroke profile ───────────────────────
+    cursor.execute("""
+        SELECT mean_dwell, std_dwell, mean_flight, std_flight
+        FROM keystroke_profiles
+        WHERE user_id = ?
+    """, (user_id,))
+    profile_row = cursor.fetchone()
+
+    if not profile_row:
+        conn.close()
+        print("⚠️  No keystroke profile on file")
+        print("="*60 + "\n")
+        return jsonify({
+            "status": "error", "authenticated": False,
+            "message": "No keystroke profile found. Please enroll first."
+        }), 403
+
+    stored_profile = {
+        "mean_dwell":  profile_row[0],
+        "std_dwell":   profile_row[1],
+        "mean_flight": profile_row[2],
+        "std_flight":  profile_row[3],
+    }
+
+    # ── 4. Validate keystroke data ──────────────────────────────────
+    dwell_times  = timings.get("dwell_times",  [])
+    flight_times = timings.get("flight_times", [])
+
+    print(f"\n👤 User           : {username}")
+    print(f"   Dwell times    : {dwell_times}")
+    print(f"   Flight times   : {flight_times}")
+    print(f"   Total keys     : {timings.get('total_keys', 0)}")
+
+    if not dwell_times or not flight_times:
+        conn.close()
         print("⚠️  No keystroke data captured")
         print("="*60 + "\n")
         return jsonify({
-            "status": "ok",
-            "authenticated": True,
-            "keystroke_verified": False,
-            "message": "Login successful (no keystroke data)"
-        })
+            "status": "error", "authenticated": False, "keystroke_verified": False,
+            "message": "No keystroke data captured. Please try again."
+        }), 400
 
-# ---------- ROUTES (HTML pages) ----------
+    # ── 5. Z-score normalised Euclidean distance ────────────────────
+    distance = z_score_euclidean_distance(
+        {"dwell_times": dwell_times, "flight_times": flight_times},
+        stored_profile
+    )
+
+    print(f"\n📏 Distance       : {distance:.4f}  (z-space, normalised by data points)")
+    print(f"   Threshold      : {Z_THRESHOLD}  (fixed z-space threshold)")
+    print(f"   std_dwell      : {stored_profile['std_dwell']:.4f}")
+    print(f"   std_flight     : {stored_profile['std_flight']:.4f}")
+    print(f"   → {'✓ MATCH' if distance <= Z_THRESHOLD else '❌ MISMATCH'}")
+
+    # ── 6. Decision ─────────────────────────────────────────────────
+    if distance > Z_THRESHOLD:
+        increment_fail(cursor, username, distance)
+        conn.commit()
+        fail_count, _ = get_fail_info(cursor, username)
+        conn.close()
+
+        remaining = max(MAX_FAILED_ATTEMPTS - fail_count, 0)
+        print(f"❌ Access denied  (attempts remaining: {remaining})")
+        print("="*60 + "\n")
+
+        if remaining == 0:
+            msg = f"Account locked for {LOCKOUT_MINUTES} minutes due to too many failed attempts."
+        else:
+            msg = (f"Keystroke pattern mismatch "
+                   f"(distance {distance:.4f} > threshold {Z_THRESHOLD}). "
+                   f"{remaining} attempt(s) remaining.")
+
+        return jsonify({
+            "status": "error", "authenticated": False, "keystroke_verified": False,
+            "distance":  round(distance, 4),
+            "threshold": Z_THRESHOLD,
+            "message":   msg,
+        }), 401
+
+    # ── Success ─────────────────────────────────────────────────────
+    reset_fail(cursor, username)
+    conn.commit()
+    conn.close()
+
+    print("✓ Keystroke verified — access granted!")
+    print("="*60 + "\n")
+
+    return jsonify({
+        "status": "ok", "authenticated": True, "keystroke_verified": True,
+        "distance":  round(distance, 4),
+        "threshold": Z_THRESHOLD,
+        "message":   "Login successful — keystroke pattern matched!",
+    })
+
+
+# ─────────────────────────────────────────────
+#  HTML ROUTES
+# ─────────────────────────────────────────────
 
 @app.route("/", methods=["GET", "POST"])
 def login():
@@ -239,118 +531,98 @@ def login():
         username = request.form["username"]
         password = request.form["password"]
 
-        conn = get_db()
+        conn   = get_db()
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT password FROM users WHERE username = ?",
-            (username,)
-        )
+        cursor.execute("SELECT password, salt FROM users WHERE username = ?", (username,))
         row = cursor.fetchone()
         conn.close()
 
         if row is None:
-            error = "Invalid username or password. Please try again or register first."
+            error = "Invalid username or password."
         else:
-            stored_hashed = row[0]
-            if stored_hashed == hash_password(password):
+            stored_hash, stored_salt = row
+            if stored_salt:
+                ok = verify_password(password, stored_hash, stored_salt)
+            else:
+                legacy = hashlib.sha256(password.encode()).hexdigest()
+                ok     = hmac.compare_digest(legacy, stored_hash)
+
+            if ok:
                 return redirect(url_for("home", username=username))
             else:
-                error = "Invalid username or password. Please try again or register first."
+                error = "Invalid username or password."
 
     return render_template("login.html", error=error)
 
+
 @app.route("/register", methods=["GET", "POST"])
 def register():
+    error   = None
     message = None
-    error = None
 
     if request.method == "POST":
         username = request.form["username"]
-        email = request.form["email"]
+        email    = request.form["email"]
         password = request.form["password"]
 
-        hashed_password = hash_password(password)
+        pw_hash, pw_salt = hash_password(password)
 
         try:
-            conn = get_db()
+            conn   = get_db()
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO users (username, email, password) VALUES (?, ?, ?)",
-                (username, email, hashed_password)
+                "INSERT INTO users (username, email, password, salt) VALUES (?, ?, ?, ?)",
+                (username, email, pw_hash, pw_salt)
             )
             conn.commit()
             conn.close()
-            
-            # After registration, redirect to enrollment
             return redirect(url_for("enroll") + f"?username={username}")
         except sqlite3.IntegrityError:
             error = "Username already exists. Choose another one."
 
     return render_template("register.html", error=error, message=message)
 
+
 @app.route("/home")
 def home():
     username = request.args.get("username")
     return render_template("home.html", username=username)
 
+
 @app.route("/enroll", methods=["GET", "POST"])
 def enroll():
+    error   = None
     message = None
-    error = None
 
     if request.method == "POST":
-        password = request.form["password"]
+        password = request.form.get("password", "").strip()
         if password:
-            message = "Password sample received. Keystroke timings will be processed in the backend."
+            message = "Password sample received. Keystroke timings processed."
         else:
             error = "Please type the password before submitting."
 
     return render_template("enroll.html", message=message, error=error)
 
-# ---------- Keystroke helper (for your friend to use later) ----------
 
-def extract_timings(events):
-    """
-    Helper function to extract dwell and flight times from raw events.
-    
-    """
-    dwell_times = []
-    flight_times = []
-    
-    last_keyup_time = None
-    keydown_times = {}
-    
-    for event in events:
-        if event['type'] == 'keydown':
-            keydown_times[event['key']] = event['timestamp']
-            
-            if last_keyup_time is not None:
-                flight_time = event['timestamp'] - last_keyup_time
-                flight_times.append(flight_time)
-        
-        elif event['type'] == 'keyup':
-            if event['key'] in keydown_times:
-                dwell_time = event['timestamp'] - keydown_times[event['key']]
-                dwell_times.append(dwell_time)
-                last_keyup_time = event['timestamp']
-    
-    return {
-        "dwell": dwell_times,
-        "flight": flight_times
-    }
-
-# ---------- MAIN ----------
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     init_db()
     print("\n" + "="*60)
-    print("STARTING")
+    print("BEHAVIORAL BIOMETRIC AUTH — READY")
     print("="*60)
-    print("✓ Keystroke capture enabled (login.js & enroll.js)")
-    print("✓ API endpoints ready (/api/enroll, /api/login-try)")
-    print("⚠️  Database storage: Pending (task)")
-    print("✓ Euclidean distance algorithm: Ready (in code)")
+    print("✓ PBKDF2-HMAC-SHA256  (salted, 260k iterations)")
+    print("✓ hmac.compare_digest  (constant-time, timing-attack safe)")
+    print("✓ Z-score normalised Euclidean distance")
+    print("✓ Fixed Z_THRESHOLD = 2.5  (pure z-space, no scale mixing)")
+    print("✓ Password-length-independent  (normalised by data points)")
+    print("✓ Division-by-zero guard  (min_std = 0.0001)")
+    print("✓ FIFO queue per key  (repeated-letter dwell bug fixed)")
+    print("✓ Consistent key names: dwell_times / flight_times everywhere")
+    print("✓ Failed attempt logging  → failed_attempts table")
+    print(f"✓ Lockout after {MAX_FAILED_ATTEMPTS} fails, auto-resets after {LOCKOUT_MINUTES} min")
+    print(f"✓ Debug mode: {'ON' if DEBUG_MODE else 'OFF'}  (set FLASK_DEBUG=true to enable)")
     print("="*60 + "\n")
-    app.run(debug=True)
-
-
+    app.run(debug=DEBUG_MODE)

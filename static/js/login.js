@@ -1,159 +1,123 @@
 // login.js - Captures keystroke dynamics during login
 console.log("login.js loaded");
 
-(function() {
+(function () {
     const passwordField = document.getElementById('password');
     if (!passwordField) {
         console.error("Password field not found!");
         return;
     }
 
-    // Store keystroke events
     let keystrokeEvents = [];
-    let keyDownTimes = {}; // Track when each key was pressed
+    // FIX: use a list per key (FIFO queue) so repeated letters don't collide
+    let keyDownTimes = {};
 
-    // Capture keydown event
-    passwordField.addEventListener('keydown', function(e) {
+    passwordField.addEventListener('keydown', function (e) {
         const key = e.key;
-        
-        // Ignore special keys like Shift, Ctrl, Alt, etc.
-        if (key.length > 1 && key !== 'Backspace' && key !== 'Enter') {
-            return;
-        }
+        if (key.length > 1 && key !== 'Backspace' && key !== 'Enter') return;
 
-        // Record keydown time
-        if (!keyDownTimes[key]) {
-            keyDownTimes[key] = e.timeStamp;
-            
-            keystrokeEvents.push({
-                key: key,
-                type: 'keydown',
-                timestamp: e.timeStamp
-            });
-        }
+        // FIX: always push, never overwrite — handles "aa", "ss", etc.
+        if (!keyDownTimes[key]) keyDownTimes[key] = [];
+        keyDownTimes[key].push(e.timeStamp);
+
+        keystrokeEvents.push({ key, type: 'keydown', timestamp: e.timeStamp });
     });
 
-    // Capture keyup event
-    passwordField.addEventListener('keyup', function(e) {
+    passwordField.addEventListener('keyup', function (e) {
         const key = e.key;
-        
-        // Ignore special keys
-        if (key.length > 1 && key !== 'Backspace' && key !== 'Enter') {
-            return;
-        }
+        if (key.length > 1 && key !== 'Backspace' && key !== 'Enter') return;
 
         const keyUpTime = e.timeStamp;
-        const keyDownTime = keyDownTimes[key];
+        const queue = keyDownTimes[key];
 
-        if (keyDownTime) {
+        if (queue && queue.length > 0) {
+            // FIX: pop the EARLIEST keydown for this key (FIFO)
+            const keyDownTime = queue.shift();
             keystrokeEvents.push({
-                key: key,
+                key,
                 type: 'keyup',
                 timestamp: keyUpTime,
                 dwell_time: keyUpTime - keyDownTime
             });
-
-            // Clear the keydown time
-            delete keyDownTimes[key];
         }
     });
 
-    // Intercept form submission to send keystroke data
+    // Clear when field is emptied
+    passwordField.addEventListener('input', function () {
+        if (this.value === '') {
+            keystrokeEvents = [];
+            keyDownTimes = {};
+        }
+    });
+
+    // Intercept form submission
     const form = passwordField.closest('form');
-    if (form) {
-        form.addEventListener('submit', function(e) {
-            e.preventDefault(); // Prevent default form submission
-            
-            const username = form.querySelector('input[name="username"]').value;
-            const password = form.querySelector('input[name="password"]').value;
+    if (!form) return;
 
-            if (!username || !password) {
-                alert('Please enter both username and password');
-                return;
-            }
+    form.addEventListener('submit', function handleSubmit(e) {
+        e.preventDefault();
 
-            // Calculate timing features
-            const timingFeatures = extractTimingFeatures(keystrokeEvents);
-            
-            console.log("Keystroke events captured:", keystrokeEvents.length);
-            console.log("Timing features:", timingFeatures);
+        const username = form.querySelector('input[name="username"]').value.trim();
+        const password = form.querySelector('input[name="password"]').value;
 
-            // Send keystroke data to backend
-            fetch('/api/login-try', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    username: username,
-                    password: password,
-                    events: keystrokeEvents,
-                    timings: timingFeatures
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                console.log("Server response:", data);
-                
-                // If keystroke verification successful, submit the actual form
-                if (data.status === 'ok' || data.authenticated) {
-                    // Now submit the form normally
-                    form.removeEventListener('submit', arguments.callee);
-                    form.submit();
-                } else {
-                    alert(data.message || 'Authentication failed. Keystroke pattern did not match.');
-                }
-            })
-            .catch(error => {
-                console.error('Error sending keystroke data:', error);
-                // On error, allow normal login (fallback)
-                form.removeEventListener('submit', arguments.callee);
+        if (!username || !password) {
+            alert('Please enter both username and password');
+            return;
+        }
+
+        const timings = extractTimingFeatures(keystrokeEvents);
+
+        console.log("Keystroke events:", keystrokeEvents.length);
+        console.log("Timings being sent:", timings);
+
+        fetch('/api/login-try', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password, timings })
+        })
+        .then(r => r.json())
+        .then(data => {
+            console.log("Server response:", data);
+            if (data.authenticated) {
+                // FIX: remove listener before submitting so no infinite loop
+                form.removeEventListener('submit', handleSubmit);
                 form.submit();
-            });
+            } else {
+                alert(data.message || 'Authentication failed. Keystroke pattern did not match.');
+                // Reset keystroke data so user can try again cleanly
+                keystrokeEvents = [];
+                keyDownTimes = {};
+            }
+        })
+        .catch(err => {
+            console.error('Network error:', err);
+            form.removeEventListener('submit', handleSubmit);
+            form.submit(); // fallback: allow login on network error
         });
-    }
+    });
 
-    // Extract dwell times and flight times
     function extractTimingFeatures(events) {
         const dwellTimes = [];
         const flightTimes = [];
-        
         let lastKeyUpTime = null;
 
-        for (let i = 0; i < events.length; i++) {
-            const event = events[i];
-            
-            // Calculate dwell time (keydown to keyup for same key)
-            if (event.type === 'keyup' && event.dwell_time) {
+        for (const event of events) {
+            if (event.type === 'keyup' && event.dwell_time != null) {
                 dwellTimes.push(event.dwell_time);
             }
-            
-            // Calculate flight time (time between consecutive key presses)
-            if (event.type === 'keydown') {
-                if (lastKeyUpTime !== null) {
-                    const flightTime = event.timestamp - lastKeyUpTime;
-                    flightTimes.push(flightTime);
-                }
+            if (event.type === 'keydown' && lastKeyUpTime !== null) {
+                flightTimes.push(event.timestamp - lastKeyUpTime);
             }
-            
             if (event.type === 'keyup') {
                 lastKeyUpTime = event.timestamp;
             }
         }
 
         return {
-            dwell_times: dwellTimes,
+            dwell_times:  dwellTimes,
             flight_times: flightTimes,
-            total_keys: dwellTimes.length
+            total_keys:   dwellTimes.length
         };
     }
-
-    // Clear events when password field is cleared
-    passwordField.addEventListener('input', function() {
-        if (this.value === '') {
-            keystrokeEvents = [];
-            keyDownTimes = {};
-        }
-    });
 
 })();
