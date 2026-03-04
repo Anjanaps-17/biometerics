@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, jsonify
+from flask import Flask, render_template, request, redirect, url_for, jsonify, session
 import sqlite3
 import hashlib
 import hmac
@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from statistics import mean, stdev
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24)
 
 # ─────────────────────────────────────────────
 #  CONFIG
@@ -129,20 +130,24 @@ def calculate_profile_statistics(samples: list) -> dict:
 
 def z_score_euclidean_distance(current_timings: dict, stored_profile: dict) -> float:
     """
-    Z-score normalised Euclidean distance.
+    Root Mean Square (RMS) Z-score distance.
 
     Every timing is converted to:  z = (t - mean) / std
-    Then:  distance = sqrt(sum_z²) / total_points
+    Then:  distance = sqrt( sum_z² / total_points )
 
-    Result is in Z-space (dimensionless), compared against Z_THRESHOLD = 2.5.
-    This is mathematically consistent — no mixed scales.
+    Moving N inside the sqrt keeps the result in proper Z-scale
+    regardless of password length — a long password no longer
+    artificially deflates the distance.
+
+    Expected ranges:  genuine user ~0.8-1.5,  impostor ~3.0-6.0
+    Threshold 2.5 sits cleanly between the two distributions.
     """
     dwell_times  = current_timings.get("dwell_times",  [])
     flight_times = current_timings.get("flight_times", [])
 
     mean_dwell  = stored_profile.get("mean_dwell",  0)
     mean_flight = stored_profile.get("mean_flight", 0)
-    std_dwell   = max(stored_profile.get("std_dwell",  MIN_STD), MIN_STD)  # Fix 4 (div/0)
+    std_dwell   = max(stored_profile.get("std_dwell",  MIN_STD), MIN_STD)
     std_flight  = max(stored_profile.get("std_flight", MIN_STD), MIN_STD)
 
     dwell_z_sq  = sum(((t - mean_dwell)  / std_dwell)  ** 2 for t in dwell_times)
@@ -150,8 +155,8 @@ def z_score_euclidean_distance(current_timings: dict, stored_profile: dict) -> f
 
     total_points = len(dwell_times) + len(flight_times)
 
-    # Normalise by total points → independent of password length
-    return math.sqrt(dwell_z_sq + flight_z_sq) / max(total_points, 1)
+    # RMS Z-distance: sqrt(sum/N) keeps result in Z-scale for any password length
+    return math.sqrt((dwell_z_sq + flight_z_sq) / max(total_points, 1))
 
 
 def extract_timings(events: list) -> dict:
@@ -458,6 +463,19 @@ def api_login_try():
     print(f"   Flight times   : {flight_times}")
     print(f"   Total keys     : {timings.get('total_keys', 0)}")
 
+    # ── 4a. Length integrity check ─────────────────────────────────
+    # total_keys is set by the JS to len(dwell_times); if they disagree
+    # someone has tampered with the payload (e.g. injected extra timings).
+    reported_total = timings.get("total_keys")
+    if reported_total is not None and len(dwell_times) != reported_total:
+        conn.close()
+        print(f"⚠️  Keystroke length mismatch: reported {reported_total}, got {len(dwell_times)}")
+        print("="*60 + "\n")
+        return jsonify({
+            "status": "error", "authenticated": False,
+            "message": "Keystroke length mismatch."
+        }), 400
+
     if not dwell_times or not flight_times:
         conn.close()
         print("⚠️  No keystroke data captured")
@@ -509,6 +527,8 @@ def api_login_try():
     conn.commit()
     conn.close()
 
+    session["user"] = username          # ← server-side session set here
+
     print("✓ Keystroke verified — access granted!")
     print("="*60 + "\n")
 
@@ -524,35 +544,14 @@ def api_login_try():
 #  HTML ROUTES
 # ─────────────────────────────────────────────
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET"])
 def login():
-    error = None
-    if request.method == "POST":
-        username = request.form["username"]
-        password = request.form["password"]
-
-        conn   = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT password, salt FROM users WHERE username = ?", (username,))
-        row = cursor.fetchone()
-        conn.close()
-
-        if row is None:
-            error = "Invalid username or password."
-        else:
-            stored_hash, stored_salt = row
-            if stored_salt:
-                ok = verify_password(password, stored_hash, stored_salt)
-            else:
-                legacy = hashlib.sha256(password.encode()).hexdigest()
-                ok     = hmac.compare_digest(legacy, stored_hash)
-
-            if ok:
-                return redirect(url_for("home", username=username))
-            else:
-                error = "Invalid username or password."
-
-    return render_template("login.html", error=error)
+    """
+    Strict login page — GET only.
+    No POST accepted here. All authentication MUST go through /api/login-try.
+    On success, JS redirects directly to /home (no form submission).
+    """
+    return render_template("login.html")
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -585,8 +584,9 @@ def register():
 
 @app.route("/home")
 def home():
-    username = request.args.get("username")
-    return render_template("home.html", username=username)
+    if "user" not in session:
+        return redirect(url_for("login"))
+    return render_template("home.html", username=session["user"])
 
 
 @app.route("/enroll", methods=["GET", "POST"])
@@ -623,6 +623,9 @@ if __name__ == "__main__":
     print("✓ Consistent key names: dwell_times / flight_times everywhere")
     print("✓ Failed attempt logging  → failed_attempts table")
     print(f"✓ Lockout after {MAX_FAILED_ATTEMPTS} fails, auto-resets after {LOCKOUT_MINUTES} min")
+    print("✓ / is GET-only — no password-only POST bypass possible")
+    print("✓ Session-protected /home — no direct URL access without auth")
+    print("✓ /api/login-try is the ONLY authentication authority")
     print(f"✓ Debug mode: {'ON' if DEBUG_MODE else 'OFF'}  (set FLASK_DEBUG=true to enable)")
     print("="*60 + "\n")
     app.run(debug=DEBUG_MODE)

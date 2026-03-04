@@ -79,9 +79,9 @@ console.log("login.js loaded");
         .then(data => {
             console.log("Server response:", data);
             if (data.authenticated) {
-                // FIX: remove listener before submitting so no infinite loop
-                form.removeEventListener('submit', handleSubmit);
-                form.submit();
+                // Redirect directly — no form POST to /
+                // Authentication is 100% API-driven via /api/login-try
+                window.location.href = "/home?username=" + encodeURIComponent(username);
             } else {
                 alert(data.message || 'Authentication failed. Keystroke pattern did not match.');
                 // Reset keystroke data so user can try again cleanly
@@ -90,9 +90,12 @@ console.log("login.js loaded");
             }
         })
         .catch(err => {
-            console.error('Network error:', err);
-            form.removeEventListener('submit', handleSubmit);
-            form.submit(); // fallback: allow login on network error
+            // SECURITY: do NOT fall back to submitting the form on network error.
+            // Doing so would allow login without biometric verification.
+            console.error('Network error during biometric check:', err);
+            alert('Network error — could not verify your typing pattern. Please try again.');
+            keystrokeEvents = [];
+            keyDownTimes = {};
         });
     });
 
